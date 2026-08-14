@@ -2,7 +2,7 @@ name: Build and Release LuCI App
 
 on: 
   push:
-    branches:
+分支:
       - main
     paths:
       - 'luci-app-ndsvoucher/Makefile'
@@ -34,7 +34,7 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: ipk, sdk_url: "https://downloads.openwrt.org/releases/23.05.4/targets/x86/64/openwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz", sdk_tar: "SDK.tar.xz", sdk_dir: "SDK", artifact_pattern: "luci-app-ndsvoucher_*.ipk" }
+          - { name: ipk, sdk_url: "https://downloads.openwrt.org/releases/23.05.4/targets/x86/64/openwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz", sdk_tar: "SDK.tar.xz", sdk_dir: "SDK", artifact_pattern: "luci-app-ndsvoucher_.ipk" }
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -305,30 +305,22 @@ jobs:
         run: |
           cd tmp/${{ matrix.target.sdk_dir }}
           echo "Checking for built IPK files..."
-          # Look for the IPK file in various possible locations
-          find . -name "luci-app-ndsvoucher_*.ipk" -type f
           IPK_FILE=$(find . -name "luci-app-ndsvoucher_*.ipk" -type f | head -1)
           if [ -z "$IPK_FILE" ]; then
             echo "Build failed: IPK file not found"
-            echo "Contents of bin directory:"
-            ls -R bin/ || echo "bin directory not found"
             echo "Contents of current directory:"
             ls -la
             exit 1
           else
             echo "Found IPK file: $IPK_FILE"
-            # Copy to a predictable location
-            cp "$IPK_FILE" ./luci-app-ndsvoucher_*.ipk
+            cp "$IPK_FILE" ./luci-app-ndsvoucher.ipk
           fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ndsvoucher-${{ matrix.target.name }}
-          path: |
-            tmp/${{ matrix.target.sdk_dir }}/bin/packages/x86_64/luci/luci-app-ndsvoucher_*.ipk
-            tmp/${{ matrix.target.sdk_dir }}/luci-app-ndsvoucher_*.ipk
-            luci-app-ndsvoucher_*.ipk
+          path: tmp/${{ matrix.target.sdk_dir }}/luci-app-ndsvoucher.ipk
 
   Release:
     runs-on: ubuntu-latest
@@ -356,8 +348,6 @@ jobs:
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            luci-app-ndsvoucher_*.ipk
-            */luci-app-ndsvoucher_*.ipk
+          files: luci-app-ndsvoucher.ipk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
