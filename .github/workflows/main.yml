@@ -1,0 +1,353 @@
+name: Build and Release LuCI App
+
+on: 
+  push:
+    branches:
+      - main
+    paths:
+      - 'luci-app-ndsvoucher/Makefile'
+  workflow_dispatch:
+  release:
+    types: [published]
+  schedule:
+    - cron: '0 2 * * 1'  # Run every Monday at 2 AM UTC
+
+jobs:
+  Get-Version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Get Version
+        id: version
+        run: |
+          echo "version=$(grep 'PKG_VERSION:=' ./luci-app-ndsvoucher/Makefile | awk -F '=' '{print $2}')" >> $GITHUB_OUTPUT
+
+  Compile:
+    runs-on: ubuntu-latest
+    needs: Get-Version
+    strategy:
+      matrix:
+        target:
+          - { name: ipk, sdk_url: "https://downloads.openwrt.org/releases/23.05.4/targets/x86/64/openwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz", sdk_tar: "SDK.tar.xz", sdk_dir: "SDK", artifact_pattern: "luci-app-ndsvoucher_.ipk" }
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Verify Package Structure
+        run: |
+          echo "Verifying package structure..."
+          cd luci-app-ndsvoucher
+          echo "Contents of luci-app-ndsvoucher:"
+          ls -la
+          
+          # Check directory structure
+          REQUIRED_DIRS=(
+            "luasrc"
+            "luasrc/controller"
+            "luasrc/model"
+            "luasrc/model/cbi"
+            "luasrc/model/cbi/ndsvoucher"
+            "luasrc/view"
+            "luasrc/view/ndsvoucher"
+            "root"
+            "root/etc"
+            "root/etc/config"
+            "root/etc/init.d"
+            "root/etc/uci-defaults"
+            "root/usr"
+            "root/usr/share"
+            "root/usr/share/ndsvoucher"
+            "root/usr/share/ndsvoucher/scripts"
+            "root/www"
+            "root/www/ndsvoucher"
+            "test"
+          )
+          
+          for dir in "${REQUIRED_DIRS[@]}"; do
+            if [ ! -d "$dir" ]; then
+              echo "ERROR: Directory $dir not found!"
+              exit 1
+            fi
+          done
+          
+          # Check required files
+          REQUIRED_FILES=(
+            "Makefile"
+            "luasrc/controller/ndsvoucher.lua"
+            "luasrc/model/cbi/ndsvoucher/settings.lua"
+            "luasrc/model/cbi/ndsvoucher/vouchers.lua"
+            "luasrc/view/ndsvoucher/public_index.htm"
+            "luasrc/view/ndsvoucher/voucher_template.htm"
+            "root/etc/config/ndsvoucher"
+            "root/etc/init.d/ndsvoucher"
+            "root/etc/uci-defaults/99-ndsvoucher"
+            "root/usr/share/ndsvoucher/scripts/voucher.sh"
+            "root/usr/share/ndsvoucher/scripts/binauth.sh"
+            "root/usr/share/ndsvoucher/scripts/configure-nodogsplash.sh"
+            "root/www/ndsvoucher/index.html"
+            "test/test_voucher.sh"
+          )
+          
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: File $file not found!"
+              exit 1
+            fi
+          done
+          
+          # Check Makefile contents
+          if ! grep -q "PKG_NAME:=luci-app-ndsvoucher" Makefile; then
+            echo "ERROR: PKG_NAME not found in Makefile!"
+            exit 1
+          fi
+          
+          if ! grep -q "PKG_VERSION:=1.0.0" Makefile; then
+            echo "ERROR: PKG_VERSION not found in Makefile!"
+            exit 1
+          fi
+          
+          if ! grep -q "include \$(TOPDIR)/feeds/luci/luci.mk" Makefile; then
+            echo "ERROR: luci.mk include not found in Makefile!"
+            exit 1
+          fi
+          
+          # Check script permissions
+          if [ -f "root/usr/share/ndsvoucher/scripts/voucher.sh" ]; then
+            if [ ! -x "root/usr/share/ndsvoucher/scripts/voucher.sh" ]; then
+              echo "WARNING: voucher.sh is not executable"
+            fi
+          fi
+          
+          if [ -f "root/usr/share/ndsvoucher/scripts/binauth.sh" ]; then
+            if [ ! -x "root/usr/share/ndsvoucher/scripts/binauth.sh" ]; then
+              echo "WARNING: binauth.sh is not executable"
+            fi
+          fi
+          
+          if [ -f "root/usr/share/ndsvoucher/scripts/configure-nodogsplash.sh" ]; then
+            if [ ! -x "root/usr/share/ndsvoucher/scripts/configure-nodogsplash.sh" ]; then
+              echo "WARNING: configure-nodogsplash.sh is not executable"
+            fi
+          fi
+          
+          echo "Package structure verified successfully."
+
+      - name: Install Dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install build-essential libncurses5-dev gawk git subversion libssl-dev gettext unzip wget curl
+
+      - name: Download SDK
+        run: |
+          mkdir -p tmp
+          # Try multiple download methods to ensure reliability
+          if ! curl -SLk --connect-timeout 30 --retry 2 "${{ matrix.target.sdk_url }}" -o "./tmp/${{ matrix.target.sdk_tar }}"; then
+            echo "curl failed, trying wget"
+            if ! wget "${{ matrix.target.sdk_url }}" -O "./tmp/${{ matrix.target.sdk_tar }}"; then
+              echo "wget also failed, cannot download SDK"
+              exit 1
+            fi
+          fi
+          cd tmp
+          # Clean up any existing SDK directory
+          rm -rf openwrt-sdk*
+          rm -rf ${{ matrix.target.sdk_dir }}
+          # Verify the download
+          if [ ! -s "${{ matrix.target.sdk_tar }}" ]; then
+            echo "Downloaded file is empty"
+            ls -la
+            exit 1
+          fi
+          # Check file type
+          file ${{ matrix.target.sdk_tar }}
+          # Check file size
+          FILE_SIZE=$(stat -c%s "${{ matrix.target.sdk_tar }}")
+          echo "Downloaded file size: $FILE_SIZE bytes"
+          if [ "$FILE_SIZE" -lt 1000000 ]; then  # Less than 1MB
+            echo "WARNING: Downloaded file seems too small, may be incomplete"
+          fi
+          # Try to list contents without extracting (redirect stderr to avoid write errors)
+          echo "Checking archive contents:"
+          if [[ "${{ matrix.target.sdk_tar }}" == *.tar.xz ]]; then
+            tar -tvJf ${{ matrix.target.sdk_tar }} 2>/dev/null | head -10 || echo "Failed to list tar.xz contents"
+          else
+            tar -tvf ${{ matrix.target.sdk_tar }} 2>/dev/null | head -10 || echo "Failed to list tar contents"
+          fi
+          # Extract with verbose output to see what's happening
+          echo "Extracting SDK..."
+          if [[ "${{ matrix.target.sdk_tar }}" == *.tar.xz ]]; then
+            tar -xJf ${{ matrix.target.sdk_tar }}
+          else
+            tar xf ${{ matrix.target.sdk_tar }}
+          fi
+          # Get the SDK directory name (using multiple methods for robustness)
+          SDK_DIR=""
+          
+          # Method 1: First entry in archive
+          SDK_DIR=$(tar tf ${{ matrix.target.sdk_tar }} 2>/dev/null | head -n1 | cut -d'/' -f1 | grep -E "^openwrt-sdk" || true)
+          
+          # Method 2: If method 1 failed, look for directory entries
+          if [ -z "$SDK_DIR" ]; then
+            SDK_DIR=$(tar tf ${{ matrix.target.sdk_tar }} 2>/dev/null | grep -E "^[^/]+/$" | head -n1 | cut -d'/' -f1 | grep -E "^openwrt-sdk" || true)
+          fi
+          
+          # Method 3: If still failed, use pattern matching
+          if [ -z "$SDK_DIR" ]; then
+            echo "Could not determine SDK directory name from archive contents"
+            echo "Listing first 20 lines of archive contents:"
+            tar tf ${{ matrix.target.sdk_tar }} 2>/dev/null | head -n20
+            SDK_DIR="openwrt-sdk*"  # Use pattern matching as fallback
+          else
+            echo "Detected SDK directory name: $SDK_DIR"
+          fi
+          # Move the SDK directory
+          echo "Moving SDK directory..."
+          if ls $SDK_DIR >/dev/null 2>&1; then
+            # Pattern matching worked
+            mv $SDK_DIR ${{ matrix.target.sdk_dir }}
+          else
+            # Try to find and move the SDK directory
+            SDK_EXTRACTED_DIR=$(ls -1d openwrt-sdk* 2>/dev/null | head -n1)
+            if [ -n "$SDK_EXTRACTED_DIR" ] && [ -d "$SDK_EXTRACTED_DIR" ]; then
+              mv "$SDK_EXTRACTED_DIR" ${{ matrix.target.sdk_dir }}
+            else
+              echo "Failed to locate extracted SDK directory"
+              ls -la | grep openwrt-sdk || echo "No openwrt-sdk directory found"
+              exit 1
+            fi
+          fi
+          echo "SDK extracted to ${{ matrix.target.sdk_dir }}"
+          ls -la ${{ matrix.target.sdk_dir }}/
+          
+          # Verify SDK extraction
+          if [ ! -d "${{ matrix.target.sdk_dir }}" ]; then
+            echo "ERROR: SDK directory was not created successfully"
+            ls -la
+            exit 1
+          fi
+          
+          # Check for essential SDK files
+          if [ ! -f "${{ matrix.target.sdk_dir }}/scripts/feeds" ]; then
+            echo "ERROR: SDK scripts not found, extraction may have failed"
+            ls -la ${{ matrix.target.sdk_dir }}/
+            exit 1
+          fi
+          
+          echo "SDK verification passed"
+
+      - name: Verify Package Structure
+        run: |
+          echo "Verifying local package structure..."
+          echo "Contents of luci-app-ndsvoucher directory:"
+          ls -la ./luci-app-ndsvoucher/
+          echo "Contents of luasrc directory:"
+          ls -la ./luci-app-ndsvoucher/luasrc/ || echo "No luasrc directory"
+          echo "Contents of root directory:"
+          ls -la ./luci-app-ndsvoucher/root/ || echo "No root directory"
+          echo "Checking for Makefile:"
+          ls -la ./luci-app-ndsvoucher/Makefile || echo "Makefile not found"
+
+      - name: Copy Package Source
+        run: |
+          mkdir -p tmp/${{ matrix.target.sdk_dir }}/package/luci-app-ndsvoucher
+          # Copy all files including hidden ones
+          cp -rf ./luci-app-ndsvoucher/* tmp/${{ matrix.target.sdk_dir }}/package/luci-app-ndsvoucher/
+          # If there are hidden files, copy them too
+          if ls ./luci-app-ndsvoucher/.* 1> /dev/null 2>&1; then
+            cp -rf ./luci-app-ndsvoucher/.* tmp/${{ matrix.target.sdk_dir }}/package/luci-app-ndsvoucher/ 2>/dev/null || true
+          fi
+          # Verify copy
+          echo "Package source copied, listing contents:"
+          ls -la tmp/${{ matrix.target.sdk_dir }}/package/luci-app-ndsvoucher/
+          echo "Contents of copied luasrc directory:"
+          ls -la tmp/${{ matrix.target.sdk_dir }}/package/luci-app-ndsvoucher/luasrc/ || echo "No luasrc directory in copy"
+          echo "Contents of copied root directory:"
+          ls -la tmp/${{ matrix.target.sdk_dir }}/package/luci-app-ndsvoucher/root/ || echo "No root directory in copy"
+
+      - name: Compile Package
+        run: |
+          cd tmp/${{ matrix.target.sdk_dir }}
+          echo "Current directory: $(pwd)"
+          echo "Contents of current directory:"
+          ls -la
+          echo "Contents of package directory:"
+          ls -la package/ || echo "No package directory"
+          echo "Contents of feeds directory:"
+          ls -la feeds/ || echo "No feeds directory"
+          echo "Updating feeds..."
+          ./scripts/feeds update -a
+          echo "Installing feeds..."
+          ./scripts/feeds install -a
+          echo "Creating default config..."
+          make defconfig
+          echo "Checking if our package is recognized..."
+          make package/luci-app-ndsvoucher/help || echo "Package not found in build system"
+          echo "Listing all luci packages..."
+          make package/luci-app-ndsvoucher/depends V=s || echo "Cannot list dependencies"
+          echo "Compiling package..."
+          make package/luci-app-ndsvoucher/compile V=99
+          echo "Compilation completed."
+          # List the bin directory to see what was built
+          echo "Contents of bin directory:"
+          find bin -name "*ndsvoucher*" -type f || echo "No ndsvoucher files found in bin directory"
+
+      - name: Check Build Results
+        run: |
+          cd tmp/${{ matrix.target.sdk_dir }}
+          echo "Checking for built IPK files..."
+          IPK_FILE=$(find . -name "luci-app-ndsvoucher_*.ipk" -type f | head -1)
+          if [ -z "$IPK_FILE" ]; then
+            echo "Build failed: IPK file not found"
+            echo "Contents of current directory:"
+            ls -la
+            exit 1
+          else
+            echo "Found IPK file: $IPK_FILE"
+            cp "$IPK_FILE" ./luci-app-ndsvoucher.ipk
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndsvoucher-${{ matrix.target.name }}
+          path: tmp/${{ matrix.target.sdk_dir }}/luci-app-ndsvoucher.ipk
+
+  Release:
+    runs-on: ubuntu-latest
+    needs: [Compile, Get-Version]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Download IPK Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ndsvoucher-ipk
+          path: ./
+
+      - name: List Downloaded Files
+        run: |
+          echo "Contents of current directory:"
+          ls -la
+          echo "Searching for IPK files:"
+          find . -name "luci-app-ndsvoucher_*.ipk" -type f || echo "No IPK files found"
+
+      - name: Create Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: luci-app-ndsvoucher.ipk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
